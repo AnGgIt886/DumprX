@@ -13,4 +13,4 @@ jobs:
       - name: Setup
         run: bash setup.sh
       - name: Dump Firmware
-        run: bash dumper.sh https://miuirom.org/id/halaman-unduh-file?o=redmi-9t&v=14.0.5.0.SJQMIXM&l=id&t=Recovery
+        run: bash dumper.sh https://bn.d.miui.com/V14.0.5.0.SJQMIXM/miui_LIMEGlobal_V14.0.5.0.SJQMIXM_057bc83463_12.0.zip
