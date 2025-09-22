@@ -1,0 +1,16 @@
+name: Update Gradle wrapper
+
+on:
+  push:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup
+        run: bash setup.sh
+      - name: Dump Firmware
+        run: bash dumper.sh https://bn.d.miui.com/V14.0.5.0.SJQMIXM/lime_global_images_V14.0.5.0.SJQMIXM_20230619.0000.00_12.0_global_917a4eb0bb.tgz
