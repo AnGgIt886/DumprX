@@ -14,3 +14,7 @@ jobs:
         run: bash setup.sh
       - name: Dump Firmware
         run: bash test.sh
+        env:
+          MY_TOKEN: '${{ secrets.MY_TOKEN }}'
+          TG_CHAT: '${{ secrets.TG_TOKEN }}'
+          TG_CHAT: '${{ secrets.TG_CHAT }}'
