@@ -2,22 +2,25 @@ name: Firmware Dump
 
 on:
   push:
+  workflow_dispatch:
 
 jobs:
-  update:
+  dump:
     runs-on: ubuntu-latest
-    permissions: write-all
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
       - name: Install SSH Key
         uses: shimataro/ssh-key-action@v2
         with:
           key: ${{ secrets.SSH }}
           name: id_rsa
           known_hosts: ${{ secrets.KNOWN_HOSTS }}
+
       - name: Setup
         run: bash setup.sh
+
       - name: Dump Firmware
         run: bash test.sh
         env:
