@@ -7,9 +7,23 @@ on:
 jobs:
   dump:
     runs-on: ubuntu-latest
+    env:
+      MY_TOKEN: ${{ secrets.MY_TOKEN }}
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT: ${{ secrets.TG_CHAT }}
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Clean-up
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 24
 
       - name: Install SSH Key
         uses: shimataro/ssh-key-action@v2
@@ -23,7 +37,3 @@ jobs:
 
       - name: Dump Firmware
         run: bash test.sh
-        env:
-          MY_TOKEN: '${{ secrets.MY_TOKEN }}'
-          TG_TOKEN: '${{ secrets.TG_TOKEN }}'
-          TG_CHAT: '${{ secrets.TG_CHAT }}'

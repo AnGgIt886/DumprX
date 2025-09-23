@@ -1,9 +1,5 @@
 #!/bin/bash
 
-if [ -z "$TERM" ]; then
-    TERM=xterm
-fi
-
 # Clear Screen
 tput reset 2>/dev/null || clear
 
