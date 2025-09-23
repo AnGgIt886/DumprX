@@ -1,4 +1,4 @@
-name: Update Gradle wrapper
+name: Firmware Dump
 
 on:
   push:
