@@ -13,6 +13,8 @@ jobs:
       - uses: LuisEnMarroquin/setup-ssh-action@v3.0.0
         with:
           SSHKEY: ${{ secrets.SSH }}
+          ORIGIN: 'gitlab.com'
+          USER: 'AnGgIt86'
       - name: Setup
         run: bash setup.sh
       - name: Dump Firmware
