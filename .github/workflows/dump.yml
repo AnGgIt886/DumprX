@@ -15,6 +15,7 @@ jobs:
         with:
           key: ${{ secrets.SSH }}
           name: id_rsa.pub
+          known_hosts: ${{ secrets.KNOWN_HOSTS }}
       - name: Setup
         run: bash setup.sh
       - name: Dump Firmware
