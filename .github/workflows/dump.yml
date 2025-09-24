@@ -23,7 +23,7 @@ jobs:
       - name: Swap Space
         uses: pierotofy/set-swap-space@master
         with:
-          swap-size-gb: 24
+          swap-size-gb: 8
 
       - name: Install SSH Key
         uses: shimataro/ssh-key-action@v2
@@ -36,4 +36,4 @@ jobs:
         run: bash setup.sh
 
       - name: Dump Firmware
-        run: bash test.sh
+        run: bash dump.sh
