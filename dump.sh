@@ -8,4 +8,4 @@ echo $TG_TOKEN >> .tg_token
 echo $TG_CHAT >> .tg_chat
 export PUSH_TO_GITLAB="true"
 export TERM=xterm
-bash dumper.sh https://sourceforge.net/projects/port/files/hyper2/PORT_xiaomi.eu_CHIME_OS2.0.7.0.VNBCNXM_15.zip/download
+bash dumper.sh https://bn.d.miui.com/V14.0.2.0.SJFMIXM/miui_CITRUSGlobal_V14.0.2.0.SJFMIXM_ed10060e54_12.0.zip
