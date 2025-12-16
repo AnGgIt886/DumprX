@@ -8,4 +8,4 @@ echo $TG_TOKEN >> .tg_token
 echo $TG_CHAT >> .tg_chat
 export PUSH_TO_GITLAB="true"
 export TERM=xterm
-bash dumper.sh https://cdnorg.d.miui.com/OS1.0.25.0.THGMIXM/miui_SWEETK6AGlobal_OS1.0.25.0.THGMIXM_9e4080947a_13.0.zip
+bash dumper.sh https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS1.0.8.0.TGCMIXM/spes_global_images_OS1.0.8.0.TGCMIXM_20240929.0000.00_13.0_global_2ba81a8074.tgz
