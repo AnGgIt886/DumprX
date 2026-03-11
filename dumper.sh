@@ -80,7 +80,6 @@ mkdir -p "${OUTDIR}" "${TMPDIR}" 2>/dev/null
 EXTERNAL_TOOLS=(
 	bkerler/oppo_ozip_decrypt
 	bkerler/oppo_decrypt
-	marin-m/vmlinux-to-elf
 	ShivamKumarJha/android_tools
 	HemanthJabalpuri/pacextractor
 )
@@ -93,6 +92,12 @@ for tool_slug in "${EXTERNAL_TOOLS[@]}"; do
 	fi
 done
 
+# Retrive 'extract-ikconfig' from torvalds/linux
+if ! [[ -f "${UTILSDIR}"/extract-ikconfig ]]; then
+    curl -s -Lo "${UTILSDIR}"/extract-ikconfig https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/scripts/extract-ikconfig
+    chmod +x "${UTILSDIR}"/extract-ikconfig
+fi
+
 ## See README.md File For Program Credits
 # Set Utility Program Alias
 SDAT2IMG="${UTILSDIR}"/sdat2img.py
@@ -100,9 +105,6 @@ SIMG2IMG="${UTILSDIR}"/bin/simg2img
 PACKSPARSEIMG="${UTILSDIR}"/bin/packsparseimg
 UNSIN="${UTILSDIR}"/unsin
 PAYLOAD_EXTRACTOR="${UTILSDIR}"/bin/payload-dumper-go
-DTC="${UTILSDIR}"/dtc
-VMLINUX2ELF="${UTILSDIR}"/vmlinux-to-elf/vmlinux-to-elf
-KALLSYMS_FINDER="${UTILSDIR}"/vmlinux-to-elf/kallsyms-finder
 OZIPDECRYPT="${UTILSDIR}"/oppo_ozip_decrypt/ozipdecrypt.py
 OFP_QC_DECRYPT="${UTILSDIR}"/oppo_decrypt/ofp_qc_decrypt.py
 OFP_MTK_DECRYPT="${UTILSDIR}"/oppo_decrypt/ofp_mtk_decrypt.py
@@ -115,7 +117,7 @@ KDZ_EXTRACT="${UTILSDIR}"/kdztools/unkdz.py
 DZ_EXTRACT="${UTILSDIR}"/kdztools/undz.py
 RUUDECRYPT="${UTILSDIR}"/RUU_Decrypt_Tool
 EXTRACT_IKCONFIG="${UTILSDIR}"/extract-ikconfig
-UNPACKBOOT="${UTILSDIR}"/unpackboot.sh
+MAGISKBOOT="${UTILSDIR}"/bin/magiskboot
 AML_EXTRACT="${UTILSDIR}"/aml-upgrade-package-extract
 AFPTOOL_EXTRACT="${UTILSDIR}"/bin/afptool
 RK_EXTRACT="${UTILSDIR}"/bin/rkImageMaker
@@ -750,65 +752,202 @@ done
 cd "${OUTDIR}"/ || exit
 rm -rf "${TMPDIR:?}"/*
 
-# Extract boot.img
-if [[ -f "${OUTDIR}"/boot.img ]]; then
-	# Extract dts
-	mkdir -p "${OUTDIR}"/bootimg "${OUTDIR}"/bootdts 2>/dev/null
-	uvx -q extract-dtb "${OUTDIR}"/boot.img -o "${OUTDIR}"/bootimg >/dev/null
-	find "${OUTDIR}"/bootimg -name '*.dtb' -type f | gawk -F'/' '{print $NF}' | while read -r i; do "${DTC}" -q -s -f -I dtb -O dts -o bootdts/"${i/\.dtb/.dts}" bootimg/"${i}"; done 2>/dev/null
-	bash "${UNPACKBOOT}" "${OUTDIR}"/boot.img "${OUTDIR}"/boot 2>/dev/null
-	printf "Boot extracted\n"
-	# extract-ikconfig
-	mkdir -p "${OUTDIR}"/bootRE
-	bash "${EXTRACT_IKCONFIG}" "${OUTDIR}"/boot.img > "${OUTDIR}"/bootRE/ikconfig 2> /dev/null
-	[[ ! -s "${OUTDIR}"/bootRE/ikconfig ]] && rm -f "${OUTDIR}"/bootRE/ikconfig 2>/dev/null
-	# vmlinux-to-elf
-	if [[ ! -f "${OUTDIR}"/vendor_boot.img ]]; then
-		python3 "${KALLSYMS_FINDER}" "${OUTDIR}"/boot.img > "${OUTDIR}"/bootRE/boot_kallsyms.txt >/dev/null 2>&1
-		printf "boot_kallsyms.txt generated\n"
-	else
-		python3 "${KALLSYMS_FINDER}" "${OUTDIR}"/boot/kernel > "${OUTDIR}"/bootRE/kernel_kallsyms.txt >/dev/null 2>&1
-		printf "kernel_kallsyms.txt generated\n"
-	fi
-	python3 "${VMLINUX2ELF}" "${OUTDIR}"/boot.img "${OUTDIR}"/bootRE/boot.elf >/dev/null 2>&1
-	printf "boot.elf generated\n"
-	[[ -f "${OUTDIR}"/boot/dtb.img ]] && {
-		mkdir -p "${OUTDIR}"/dtbimg 2>/dev/null
-		uvx -q extract-dtb "${OUTDIR}"/boot/dtb.img -o "${OUTDIR}"/dtbimg >/dev/null
-	}
+get_bootimg_info() {
+    local bootimg="$1"
+    local tempdir="$2"
+
+    # Detect and skip MTK/vendor header
+    local offset
+    offset=$(grep -abo "ANDROID!\|VNDRBOOT" "$bootimg" | cut -f1 -d:)
+    [[ -z "$offset" ]] && { echo "ERROR: No Android/VndrBoot magic found"; return 1; }
+
+    local VNDRBOOT=false
+    grep -qabo "VNDRBOOT" "$bootimg" && VNDRBOOT=true
+
+    local header_addr=40
+    $VNDRBOOT && header_addr=8
+
+    # Read header version
+    local version
+    version=$(od -A n -D -j "$header_addr" -N 1 "$bootimg" | sed 's/ //g')
+
+    # Read sizes
+    local kernel_size ramdisk_size second_size dtb_size dtbo_size page_size
+    kernel_size=$(od -A n -D -j 8  -N 4 "$bootimg" | sed 's/ //g')
+    ramdisk_size=$(od -A n -D -j 16 -N 4 "$bootimg" | sed 's/ //g')
+    second_size=$(od -A n -D -j 24 -N 4 "$bootimg" | sed 's/ //g')
+    page_size=$(od -A n -D -j 36 -N 4 "$bootimg" | sed 's/ //g')
+    dtb_size=$(od -A n -D -j 40 -N 4 "$bootimg" | sed 's/ //g')
+    dtbo_size=$(od -A n -D -j 1632 -N 4 "$bootimg" | sed 's/ //g')
+
+    # Read addresses
+    local kernel_addr ramdisk_addr second_addr tags_addr dtb_addr dtbo_addr
+    kernel_addr=0x$(od -A n -X -j 12 -N 4 "$bootimg" | sed 's/ //g;s/^0*//')
+    ramdisk_addr=0x$(od -A n -X -j 20 -N 4 "$bootimg" | sed 's/ //g;s/^0*//')
+    second_addr=0x$(od -A n -X -j 28 -N 4 "$bootimg" | sed 's/ //g;s/^0*//')
+    tags_addr=0x$(od -A n -X -j 32 -N 4 "$bootimg" | sed 's/ //g;s/^0*//')
+    [[ $dtbo_size -gt 0 ]] && \
+        dtbo_addr=0x$(od -A n -X -j 1636 -N 4 "$bootimg" | sed 's/ //g;s/^0*//')
+
+    # Read board and cmdline
+    local board cmd_line os_version patch_level
+    board=$(od -A n -S1 -j 48 -N 16 "$bootimg")
+    cmd_line=$(od -A n -S1 -j 64 -N 512 "$bootimg")
+
+    # Version-specific overrides
+    if [[ $version -eq 2 ]]; then
+        dtb_size=$(od -A n -D -j 1648 -N 4 "$bootimg" | sed 's/ //g')
+        dtb_addr=0x$(od -A n -X -j 1652 -N 4 "$bootimg" | sed 's/ //g;s/^0*//')
+
+    elif [[ $version -eq 3 ]]; then
+        page_size=4096
+        board=; second_size=0; second_addr=; dtb_size=0; dtb_addr=
+
+        if $VNDRBOOT; then
+            kernel_addr=0x$(od -A n -X -j 16 -N 4 "$bootimg" | sed 's/ //g;s/^0*//')
+            ramdisk_addr=0x$(od -A n -X -j 20 -N 4 "$bootimg" | sed 's/ //g;s/^0*//')
+            ramdisk_size=$(od -A n -D -j 24 -N 4 "$bootimg" | sed 's/ //g')
+            cmd_line=$(od -A n -S1 -j 28 -N 2048 "$bootimg")
+            tags_addr=0x$(od -A n -X -j 2076 -N 4 "$bootimg" | sed 's/ //g;s/^0*//')
+            dtb_size=$(od -A n -D -j 2100 -N 4 "$bootimg" | sed 's/ //g')
+            dtb_addr=0x$(od -A n -X -j 2104 -N 4 "$bootimg" | sed 's/ //g;s/^0*//')
+        else
+            kernel_addr=0x00008000
+            kernel_size=$(od -A n -D -j 8  -N 4 "$bootimg" | sed 's/ //g')
+            ramdisk_size=$(od -A n -D -j 12 -N 4 "$bootimg" | sed 's/ //g')
+            cmd_line=$(od -A n -S1 -j 44 -N 1536 "$bootimg")
+            local raw_os
+            raw_os=$(od -A n -D -j 16 -N 4 "$bootimg" | sed 's/ //g')
+            patch_level=$(( raw_os & ((1<<11)-1) ))
+            raw_os=$(( raw_os >> 11 ))
+            os_version=$(( raw_os>>14 )).$(( (raw_os>>7) & ((1<<7)-1) )).$(( raw_os & ((1<<7)-1) ))
+            patch_level=$(( (patch_level>>4) + 2000 )):$(( patch_level & ((1<<4)-1) ))
+            kernel_addr=; ramdisk_addr=; tags_addr=
+        fi
+    fi
+
+    # Compute offsets from base
+    local base_addr
+    base_addr=$(( kernel_addr - 0x00008000 ))
+
+    _fmt_offset() { printf "0x%08x" "$(( $1 - base_addr ))"; }
+
+    local kernel_offset ramdisk_offset second_offset tags_offset dtb_offset dtbo_offset
+    [[ -n "$kernel_addr"  ]] && kernel_offset=$(_fmt_offset  "$kernel_addr")
+    [[ -n "$ramdisk_addr" ]] && ramdisk_offset=$(_fmt_offset "$ramdisk_addr")
+    [[ -n "$second_addr"  ]] && second_offset=$(_fmt_offset  "$second_addr")
+    [[ -n "$tags_addr"    ]] && tags_offset=$(_fmt_offset    "$tags_addr")
+    [[ -n "$dtb_addr"     ]] && dtb_offset=$(_fmt_offset     "$dtb_addr")
+    [[ -n "$dtbo_addr"    ]] && dtbo_offset=$(_fmt_offset    "$dtbo_addr")
+    base_addr=$(printf "0x%08x" "$base_addr")
+
+    # Suppress offsets based on version/type
+    if [[ $version -gt 2 ]] && ! $VNDRBOOT; then
+        tags_offset=; ramdisk_offset=
+    fi
+    $VNDRBOOT && kernel_addr= && dtbo_offset=
+
+    # Write img_info
+    {
+        echo "kernel=kernel"
+        echo "ramdisk=ramdisk"
+        echo "page_size=$page_size"
+        echo "kernel_size=$kernel_size"
+        echo "ramdisk_size=$ramdisk_size"
+        echo "base_addr=$base_addr"
+        [[ -n "$kernel_offset"  ]] && echo "kernel_offset=$kernel_offset"
+        [[ -n "$ramdisk_offset" ]] && echo "ramdisk_offset=$ramdisk_offset"
+        [[ -n "$tags_offset"    ]] && echo "tags_offset=$tags_offset"
+        [[ -n "$second_size"    ]] && [[ $second_size -gt 0 ]] && echo "second=second.img" && echo "second_size=$second_size" && echo "second_offset=$second_offset"
+        [[ -n "$dtbo_size"      ]] && [[ $dtbo_size  -gt 0 ]] && echo "dtbo=dtbo.img"     && echo "dtbo_size=$dtbo_size"     && echo "dtbo_offset=$dtbo_offset"
+        [[ -n "$dtb_size"       ]] && [[ $dtb_size   -gt 0 ]] && echo "dt=dtb.img"        && echo "dtb_size=$dtb_size"       && [[ $version -gt 1 ]] && echo "dtb_offset=$dtb_offset"
+        [[ -n "$os_version"     ]] && echo "os_version=$os_version"
+        [[ -n "$patch_level"    ]] && echo "os_patch_level=$patch_level"
+        [[ -n "$board"          ]] && echo "board=\"$board\""
+        echo "cmd_line='$(echo "$cmd_line" | sed "s/'/'\"'\"'/g")'"
+    } > "$tempdir/img_info"
+}
+
+# Extract and decompile device-tree blobs
+for image in boot vendor_boot vendor_kernel_boot init_boot recovery; do
+    if [[ -f "${image}".img ]]; then
+        # Create working directories
+        mkdir -p "${image}/dtb" "${image}/dts"
+
+        # Unpack image's content
+        echo "Extracting '${image}' content..."
+		cd "${image}"
+        ${MAGISKBOOT} unpack ../"${image}.img" > /dev/null
+		cd -
+		get_bootimg_info "${image}.img" "${image}"
+
+        ## Retrive image's ramdisk, and extract it
+		ramdiskfile=$(find "${image}" -type f -name "ramdisk.cpio" | head -1)
+		${BIN_7ZZ} -snld x "${ramdiskfile}" -o"${image}/ramdisk" >> /dev/null 2>&1 || \
+			echo "Failed to extract ramdisk."
+
+        ## Clean-up
+		rm -rf "${ramdiskfile}" "${image}/vendor_ramdisk"
+
+        # Extract 'dtb' via 'extract-dtb'
+        echo "Trying to extract device-tree(s) from '${image}'..." 
+        uvx extract-dtb "${image}.img" -o "${image}/dtb" >> /dev/null 2>&1 || \
+            echo "Failed to extract device-tree blobs."
+
+        # Remove '00_kernel'
+        rm -rf "${image}/dtb/00_kernel"
+
+        # Decompile blobs to 'dts' via 'dtc'
+        for dtb in $(find "${image}/dtb" -type f); do
+            dtc -q -I dtb -O dts "${dtb}" >> "${image}/dts/$(basename "${dtb}" | sed 's/\.dtb/.dts/')" || \
+                echo "Failed to decompile device-tree blobs."
+        done
+    fi
+
+    # If no device-tree were extracted or decompiled, delete the directories
+    if ! ls -A ${image}/dtb >> /dev/null 2>&1; then
+        rm -rf "${image}/dtb" "${image}/dts"
+    fi
+done
+
+# Extract 'boot.img'-related content
+if [[ -f boot.img ]]; then
+    # Extract 'ikconfig'
+    echo "Extracting 'ikconfig'..."
+    ${EXTRACT_IKCONFIG} boot.img > ikconfig || {
+        echo "[ERROR] Failed to generate 'ikconfig'"
+    }
+
+    # Generate non-stack symbols
+    echo "[INFO] Generating 'kallsyms.txt'..."
+    uvx -q --from git+https://github.com/marin-m/vmlinux-to-elf@master kallsyms-finder boot.img >> /dev/null 2>&1 > kallsyms.txt || \
+        echo "[ERROR] Failed to generate 'kallsyms.txt'"
+
+    # Generate analyzable '.elf'
+    echo "[INFO] Extracting 'boot.elf'..."
+    uvx -q --from git+https://github.com/marin-m/vmlinux-to-elf@master vmlinux-to-elf boot.img boot.elf >> /dev/null 2>&1 > /dev/null ||
+        echo "[ERROR] Failed to generate 'boot.elf'"
+
 fi
 
-# Extract vendor_boot.img
-if [[ -f "${OUTDIR}"/vendor_boot.img ]]; then
-	# Extract dts
-	mkdir -p "${OUTDIR}"/vendor_bootimg "${OUTDIR}"/vendor_bootdts 2>/dev/null
-	uvx -q extract-dtb "${OUTDIR}"/vendor_boot.img -o "${OUTDIR}"/vendor_bootimg >/dev/null
-	find "${OUTDIR}"/vendor_bootimg -name '*.dtb' -type f | gawk -F'/' '{print $NF}' | while read -r i; do "${DTC}" -q -s -f -I dtb -O dts -o vendor_bootdts/"${i/\.dtb/.dts}" vendor_bootimg/"${i}"; done 2>/dev/null
-	bash "${UNPACKBOOT}" "${OUTDIR}"/vendor_boot.img "${OUTDIR}"/vendor_boot 2>/dev/null
-	printf "Vendor Boot extracted\n"
-	# extract-ikconfig
-	mkdir -p "${OUTDIR}"/vendor_bootRE
-	# vmlinux-to-elf
-	python3 "${VMLINUX2ELF}" "${OUTDIR}"/vendor_boot.img "${OUTDIR}"/vendor_bootRE/vendor_boot.elf >/dev/null 2>&1
-	printf "vendor_boot.elf generated\n"
-	[[ -f "${OUTDIR}"/vendor_boot/dtb.img ]] && {
-		mkdir -p "${OUTDIR}"/vendor_dtbimg 2>/dev/null
-		uvx -q extract-dtb "${OUTDIR}"/vendor_boot/dtb.img -o "${OUTDIR}"/vendor_dtbimg >/dev/null
-	}
-fi
+# Extract 'dtbo.img' separately
+if [[ -f dtbo.img ]]; then
+    # Create working directories
+    mkdir -p "dtbo/dts"
 
-# Extract recovery.img
-if [[ -f "${OUTDIR}"/recovery.img ]]; then
-	bash "${UNPACKBOOT}" "${OUTDIR}"/recovery.img "${OUTDIR}"/recovery 2>/dev/null
-	printf "Recovery extracted\n"
-fi
+    # Extract 'dtb' via 'extract-dtb'
+    echo "Trying to extract device-tree(s) from 'dtbo'..." 
+    uvx extract-dtb "dtbo.img" -o "dtbo/"  >> /dev/null 2>&1 || \
+        echo "Failed to extract device-tree blobs."
 
-# Extract dtbo
-if [[ -f "${OUTDIR}"/dtbo.img ]]; then
-	mkdir -p "${OUTDIR}"/dtbo "${OUTDIR}"/dtbodts 2>/dev/null
-	uvx -q extract-dtb "${OUTDIR}"/dtbo.img -o "${OUTDIR}"/dtbo >/dev/null
-	find "${OUTDIR}"/dtbo -name '*.dtb' -type f | gawk -F'/' '{print $NF}' | while read -r i; do "${DTC}" -q -s -f -I dtb -O dts -o dtbodts/"${i/\.dtb/.dts}" dtbo/"${i}"; done 2>/dev/null
-	printf "dtbo extracted\n"
+    # Remove '00_kernel'
+    rm -rf "dtbo/00_kernel"
+
+    # Decompile blobs to 'dts' via 'dtc'
+    for dtb in $(find "dtbo" -type f -name "*.dtb"); do
+        dtc -q -I dtb -O dts "${dtb}" >> "dtbo/dts/$(basename "${dtb}" | sed 's/\.dtb/.dts/')" || \
+            echo "Failed to decompile device-tree blobs."
+    done
 fi
 
 # Extract Partitions
@@ -884,99 +1023,213 @@ sort -u < "${TMPDIR}"/board-info.txt > "${OUTDIR}"/board-info.txt
 # set variables
 [[ $(find "$(pwd)"/system "$(pwd)"/system/system "$(pwd)"/vendor "$(pwd)"/*product -maxdepth 1 -type f -name "build*.prop" 2>/dev/null | sort -u | gawk '{print $NF}') ]] || { printf "No system/vendor/product build*.prop found, pushing cancelled.\n" && exit 1; }
 
-flavor=$(grep -m1 -oP "(?<=^ro.build.flavor=).*" -hs {system,system/system,vendor}/build*.prop)
-[[ -z "${flavor}" ]] && flavor=$(grep -m1 -oP "(?<=^ro.vendor.build.flavor=).*" -hs vendor/build*.prop)
-[[ -z "${flavor}" ]] && flavor=$(grep -m1 -oP "(?<=^ro.system.build.flavor=).*" -hs {system,system/system}/build*.prop)
-[[ -z "${flavor}" ]] && flavor=$(grep -m1 -oP "(?<=^ro.build.type=).*" -hs {system,system/system}/build*.prop)
-release=$(grep -m1 -oP "(?<=^ro.build.version.release=).*" -hs {system,system/system,vendor}/build*.prop)
-[[ -z "${release}" ]] && release=$(grep -m1 -oP "(?<=^ro.vendor.build.version.release=).*" -hs vendor/build*.prop)
-[[ -z "${release}" ]] && release=$(grep -m1 -oP "(?<=^ro.system.build.version.release=).*" -hs {system,system/system}/build*.prop)
-id=$(grep -m1 -oP "(?<=^ro.build.id=).*" -hs {system,system/system,vendor}/build*.prop)
-[[ -z "${id}" ]] && id=$(grep -m1 -oP "(?<=^ro.vendor.build.id=).*" -hs vendor/build*.prop)
-[[ -z "${id}" ]] && id=$(grep -m1 -oP "(?<=^ro.system.build.id=).*" -hs {system,system/system}/build*.prop)
-tags=$(grep -m1 -oP "(?<=^ro.build.tags=).*" -hs {system,system/system,vendor}/build*.prop)
-[[ -z "${tags}" ]] && tags=$(grep -m1 -oP "(?<=^ro.vendor.build.tags=).*" -hs vendor/build*.prop)
-[[ -z "${tags}" ]] && tags=$(grep -m1 -oP "(?<=^ro.system.build.tags=).*" -hs {system,system/system}/build*.prop)
-platform=$(grep -m1 -oP "(?<=^ro.board.platform=).*" -hs {system,system/system,vendor}/build*.prop | head -1)
-[[ -z "${platform}" ]] && platform=$(grep -m1 -oP "(?<=^ro.vendor.board.platform=).*" -hs vendor/build*.prop)
-[[ -z "${platform}" ]] && platform=$(grep -m1 -oP "(?<=^ro.system.board.platform=).*" -hs {system,system/system}/build*.prop)
-manufacturer=$(grep -m1 -oP "(?<=^ro.product.manufacturer=).*" -hs {system,system/system,vendor}/build*.prop | head -1)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.product.brand.sub=).*" -hs system/system/euclid/my_product/build*.prop)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.vendor.product.manufacturer=).*" -hs vendor/build*.prop | head -1)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.product.vendor.manufacturer=).*" -hs vendor/build*.prop | head -1)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.system.product.manufacturer=).*" -hs {system,system/system}/build*.prop)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.product.system.manufacturer=).*" -hs {system,system/system}/build*.prop)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.product.odm.manufacturer=).*" -hs vendor/odm/etc/build*.prop)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.product.manufacturer=).*" -hs {oppo_product,my_product,product}/build*.prop | head -1)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.product.manufacturer=).*" -hs vendor/euclid/*/build.prop)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.system.product.manufacturer=).*" -hs vendor/euclid/*/build.prop)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.product.product.manufacturer=).*" -hs vendor/euclid/product/build*.prop)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.product.vendor.manufacturer=).*" -hs vendor/build*.prop)
-[[ -z "${manufacturer}" ]] && manufacturer=$(grep -m1 -oP "(?<=^ro.product.system.manufacturer=).*" -hs {system,system/system}/build*.prop)
-fingerprint=$(grep -m1 -oP "(?<=^ro.build.fingerprint=).*" -hs {system,system/system}/build*.prop)
-[[ -z "${fingerprint}" ]] && fingerprint=$(grep -m1 -oP "(?<=^ro.vendor.build.fingerprint=).*" -hs vendor/build*.prop | head -1)
-[[ -z "${fingerprint}" ]] && fingerprint=$(grep -m1 -oP "(?<=^ro.system.build.fingerprint=).*" -hs {system,system/system}/build*.prop)
-[[ -z "${fingerprint}" ]] && fingerprint=$(grep -m1 -oP "(?<=^ro.product.build.fingerprint=).*" -hs product/build*.prop)
-[[ -z "${fingerprint}" ]] && fingerprint=$(grep -m1 -oP "(?<=^ro.build.fingerprint=).*" -hs {oppo_product,my_product}/build*.prop)
-[[ -z "${fingerprint}" ]] && fingerprint=$(grep -m1 -oP "(?<=^ro.system.build.fingerprint=).*" -hs my_product/build.prop)
-[[ -z "${fingerprint}" ]] && fingerprint=$(grep -m1 -oP "(?<=^ro.vendor.build.fingerprint=).*" -hs my_product/build.prop)
-[[ -z "${fingerprint}" ]] && fingerprint=$(grep -m1 -oP "(?<=^ro.bootimage.build.fingerprint=).*" -hs vendor/build.prop)
-brand=$(grep -m1 -oP "(?<=^ro.product.brand=).*" -hs {system,system/system,vendor}/build*.prop | head -1)
-[[ -z "${brand}" ]] && brand=$(grep -m1 -oP "(?<=^ro.product.brand.sub=).*" -hs system/system/euclid/my_product/build*.prop)
-[[ -z "${brand}" ]] && brand=$(grep -m1 -oP "(?<=^ro.product.vendor.brand=).*" -hs vendor/build*.prop | head -1)
-[[ -z "${brand}" ]] && brand=$(grep -m1 -oP "(?<=^ro.vendor.product.brand=).*" -hs vendor/build*.prop | head -1)
-[[ -z "${brand}" ]] && brand=$(grep -m1 -oP "(?<=^ro.product.system.brand=).*" -hs {system,system/system}/build*.prop | head -1)
-[[ -z "${brand}" || ${brand} == "OPPO" ]] && brand=$(grep -m1 -oP "(?<=^ro.product.system.brand=).*" -hs vendor/euclid/*/build.prop | head -1)
-[[ -z "${brand}" ]] && brand=$(grep -m1 -oP "(?<=^ro.product.product.brand=).*" -hs vendor/euclid/product/build*.prop)
-[[ -z "${brand}" ]] && brand=$(grep -m1 -oP "(?<=^ro.product.odm.brand=).*" -hs vendor/odm/etc/build*.prop)
-[[ -z "${brand}" ]] && brand=$(grep -m1 -oP "(?<=^ro.product.brand=).*" -hs {oppo_product,my_product}/build*.prop | head -1)
-[[ -z "${brand}" ]] && brand=$(grep -m1 -oP "(?<=^ro.product.brand=).*" -hs vendor/euclid/*/build.prop | head -1)
-[[ -z "${brand}" ]] && brand=$(echo "$fingerprint" | cut -d'/' -f1)
-codename=$(grep -m1 -oP "(?<=^ro.product.device=).*" -hs {vendor,system,system/system}/build*.prop | head -1)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.vendor.product.device.oem=).*" -hs vendor/euclid/odm/build.prop | head -1)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.product.vendor.device=).*" -hs vendor/build*.prop | head -1)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.vendor.product.device=).*" -hs vendor/build*.prop | head -1)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.product.system.device=).*" -hs {system,system/system}/build*.prop | head -1)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.product.system.device=).*" -hs vendor/euclid/*/build.prop | head -1)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.product.product.device=).*" -hs vendor/euclid/*/build.prop | head -1)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.product.product.model=).*" -hs vendor/euclid/*/build.prop | head -1)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.product.device=).*" -hs {oppo_product,my_product}/build*.prop | head -1)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.product.product.device=).*" -hs oppo_product/build*.prop)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.product.system.device=).*" -hs my_product/build*.prop)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.product.vendor.device=).*" -hs my_product/build*.prop)
-[[ -z "${codename}" ]] && codename=$(echo "$fingerprint" | cut -d'/' -f3 | cut -d':' -f1)
-[[ -z "${codename}" ]] && codename=$(grep -m1 -oP "(?<=^ro.build.fota.version=).*" -hs {system,system/system}/build*.prop | cut -d'-' -f1 | head -1)
-[[ -z "${codename}" ]] && codename=$(grep -oP "(?<=^ro.build.product=).*" -hs {vendor,system,system/system}/build*.prop | head -1)
-description=$(grep -m1 -oP "(?<=^ro.build.description=).*" -hs {system,system/system,vendor}/build*.prop | head -1)
-[[ -z "${description}" ]] && description=$(grep -m1 -oP "(?<=^ro.vendor.build.description=).*" -hs vendor/build*.prop)
-[[ -z "${description}" ]] && description=$(grep -m1 -oP "(?<=^ro.system.build.description=).*" -hs {system,system/system}/build*.prop)
-[[ -z "${description}" ]] && description=$(grep -m1 -oP "(?<=^ro.product.build.description=).*" -hs product/build.prop)
-[[ -z "${description}" ]] && description=$(grep -m1 -oP "(?<=^ro.product.build.description=).*" -hs product/build*.prop)
-incremental=$(grep -m1 -oP "(?<=^ro.build.version.incremental=).*" -hs {system,system/system,vendor}/build*.prop | head -1)
-[[ -z "${incremental}" ]] && incremental=$(grep -m1 -oP "(?<=^ro.vendor.build.version.incremental=).*" -hs vendor/build*.prop)
-[[ -z "${incremental}" ]] && incremental=$(grep -m1 -oP "(?<=^ro.system.build.version.incremental=).*" -hs {system,system/system}/build*.prop | head -1)
-[[ -z "${incremental}" ]] && incremental=$(grep -m1 -oP "(?<=^ro.build.version.incremental=).*" -hs my_product/build*.prop)
-[[ -z "${incremental}" ]] && incremental=$(grep -m1 -oP "(?<=^ro.system.build.version.incremental=).*" -hs my_product/build*.prop)
-[[ -z "${incremental}" ]] && incremental=$(grep -m1 -oP "(?<=^ro.vendor.build.version.incremental=).*" -hs my_product/build*.prop)
-# For Realme devices with empty incremental & fingerprint,
-[[ -z "${incremental}" && "${brand}" =~ "realme" ]] && incremental=$(grep -m1 -oP "(?<=^ro.build.version.ota=).*" -hs {vendor/euclid/product,oppo_product}/build.prop | rev | cut -d'_' -f'1-2' | rev)
-[[ -z "${incremental}" && ! -z "${description}" ]] && incremental=$(echo "${description}" | cut -d' ' -f4)
-[[ -z "${description}" && ! -z "${incremental}" ]] && description="${flavor} ${release} ${id} ${incremental} ${tags}"
-[[ -z "${description}" && -z "${incremental}" ]] && description="${codename}"
-abilist=$(grep -m1 -oP "(?<=^ro.product.cpu.abilist=).*" -hs {system,system/system}/build*.prop | head -1)
-[[ -z "${abilist}" ]] && abilist=$(grep -m1 -oP "(?<=^ro.vendor.product.cpu.abilist=).*" -hs vendor/build*.prop)
-locale=$(grep -m1 -oP "(?<=^ro.product.locale=).*" -hs {system,system/system}/build*.prop | head -1)
-[[ -z "${locale}" ]] && locale=undefined
-density=$(grep -m1 -oP "(?<=^ro.sf.lcd_density=).*" -hs {system,system/system}/build*.prop | head -1)
-[[ -z "${density}" ]] && density=undefined
-is_ab=$(grep -m1 -oP "(?<=^ro.build.ab_update=).*" -hs {system,system/system,vendor}/build*.prop)
-[[ -z "${is_ab}" ]] && is_ab="false"
-treble_support=$(grep -m1 -oP "(?<=^ro.treble.enabled=).*" -hs {system,system/system}/build*.prop)
-[[ -z "${treble_support}" ]] && treble_support="false"
-otaver=$(grep -m1 -oP "(?<=^ro.build.version.ota=).*" -hs {vendor/euclid/product,oppo_product,system,system/system}/build*.prop | head -1)
-[[ ! -z "${otaver}" && -z "${fingerprint}" ]] && branch=$(echo "${otaver}" | tr ' ' '-')
-[[ -z "${otaver}" ]] && otaver=$(grep -m1 -oP "(?<=^ro.build.fota.version=).*" -hs {system,system/system}/build*.prop | head -1)
-[[ -z "${branch}" ]] && branch=$(echo "${description}" | tr ' ' '-')
+# Helper: grep last match from files
+get_prop() {
+    local prop="$1"
+    shift
+    local file val
+    for file in "$@"; do
+        val=$(grep -h -oP "(?<=^${prop}=).*" "$file" 2>/dev/null | tail -1)
+        if [[ -n "$val" ]]; then
+            echo "$val"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 'flavor' property (e.g. caiman-user)
+flavor=$(
+    get_prop "ro.build.flavor"        {vendor,system,system/system}/build.prop        ||
+    get_prop "ro.vendor.build.flavor" vendor/build*.prop                              ||
+    get_prop "ro.build.flavor"        {vendor,system,system/system}/build*.prop       ||
+    get_prop "ro.system.build.flavor" {system,system/system}/build*.prop              ||
+    get_prop "ro.build.type"          {system,system/system}/build*.prop
+)
+
+# 'release' property (e.g. 15)
+release=$(
+    get_prop "ro.build.version.release"        {my_manifest,vendor,system,system/system}/build*.prop ||
+    get_prop "ro.vendor.build.version.release" vendor/build*.prop                                    ||
+    get_prop "ro.system.build.version.release" {system,system/system}/build*.prop
+)
+
+# 'id' property (e.g. AP4A.241205.013)
+id=$(
+    get_prop "ro.build.id"        my_manifest/build*.prop                   ||
+    get_prop "ro.build.id"        system/system/build_default.prop          ||
+    get_prop "ro.build.id"        vendor/euclid/my_manifest/build.prop      ||
+    get_prop "ro.build.id"        {vendor,system,system/system}/build*.prop ||
+    get_prop "ro.vendor.build.id" vendor/build*.prop                        ||
+    get_prop "ro.system.build.id" {system,system/system}/build*.prop
+)
+
+# 'incremental' property (e.g. 12621605)
+incremental=$(
+    get_prop "ro.build.version.incremental"        my_manifest/build*.prop                   ||
+    get_prop "ro.build.version.incremental"        system/system/build_default.prop          ||
+    get_prop "ro.build.version.incremental"        vendor/euclid/my_manifest/build.prop      ||
+    get_prop "ro.build.version.incremental"        {vendor,system,system/system}/build*.prop ||
+    get_prop "ro.vendor.build.version.incremental" my_manifest/build*.prop                   ||
+    get_prop "ro.vendor.build.version.incremental" vendor/euclid/my_manifest/build.prop      ||
+    get_prop "ro.vendor.build.version.incremental" vendor/build*.prop                        ||
+    get_prop "ro.system.build.version.incremental" {system,system/system}/build*.prop        ||
+    get_prop "ro.build.version.incremental"        my_product/build*.prop                    ||
+    get_prop "ro.system.build.version.incremental" my_product/build*.prop                    ||
+    get_prop "ro.vendor.build.version.incremental" my_product/build*.prop
+)
+
+# 'tags' property (e.g. release-keys)
+tags=$(
+    get_prop "ro.build.tags"        {vendor,system,system/system}/build*.prop ||
+    get_prop "ro.vendor.build.tags" vendor/build*.prop                        ||
+    get_prop "ro.system.build.tags" {system,system/system}/build*.prop
+)
+
+# 'platform' property (e.g. zumapro)
+platform=$(
+    grep -h -oP '(?<=^ro.board.platform=)(?!common$).*' {vendor,system,system/system}/build*.prop 2>/dev/null | tail -1 ||
+    get_prop "ro.vendor.board.platform" vendor/build*.prop                                                              ||
+    get_prop "ro.system.board.platform" {system,system/system}/build*.prop
+)
+
+# 'manufacturer' property (e.g. google)
+manufacturer=$(
+    get_prop "ro.product.odm.manufacturer"     odm/etc/build*.prop                          ||
+    get_prop "ro.product.manufacturer"         odm/etc/fingerprint/build.default.prop       ||
+    get_prop "ro.product.manufacturer"         my_product/build*.prop                       ||
+    get_prop "ro.product.manufacturer"         my_manifest/build*.prop                      ||
+    get_prop "ro.product.manufacturer"         system/system/build_default.prop             ||
+    get_prop "ro.product.manufacturer"         vendor/euclid/my_manifest/build.prop         ||
+    get_prop "ro.product.manufacturer"         {vendor,system,system/system}/build*.prop    ||
+    get_prop "ro.product.brand.sub"            my_product/build*.prop                       ||
+    get_prop "ro.product.brand.sub"            system/system/euclid/my_product/build*.prop  ||
+    get_prop "ro.vendor.product.manufacturer"  vendor/build*.prop                           ||
+    get_prop "ro.product.vendor.manufacturer"  my_manifest/build*.prop                      ||
+    get_prop "ro.product.vendor.manufacturer"  system/system/build_default.prop             ||
+    get_prop "ro.product.vendor.manufacturer"  vendor/euclid/my_manifest/build.prop         ||
+    get_prop "ro.product.vendor.manufacturer"  vendor/build*.prop                           ||
+    get_prop "ro.system.product.manufacturer"  {system,system/system}/build*.prop           ||
+    get_prop "ro.product.system.manufacturer"  {system,system/system}/build*.prop           ||
+    get_prop "ro.product.odm.manufacturer"     my_manifest/build*.prop                      ||
+    get_prop "ro.product.odm.manufacturer"     system/system/build_default.prop             ||
+    get_prop "ro.product.odm.manufacturer"     vendor/euclid/my_manifest/build.prop         ||
+    get_prop "ro.product.odm.manufacturer"     vendor/odm/etc/build*.prop                   ||
+    get_prop "ro.product.manufacturer"         {oppo_product,my_product}/build*.prop        ||
+    get_prop "ro.product.manufacturer"         vendor/euclid/*/build.prop                   ||
+    get_prop "ro.system.product.manufacturer"  vendor/euclid/*/build.prop                   ||
+    get_prop "ro.product.product.manufacturer" vendor/euclid/product/build*.prop
+)
+
+# 'fingerprint' property (e.g. google/caiman/caiman:15/AP4A.241205.013/12621605:user/release-keys)
+fingerprint=$(
+    get_prop "ro.odm.build.fingerprint"     odm/etc/*build*.prop                   ||
+    get_prop "ro.vendor.build.fingerprint"  my_manifest/build*.prop                ||
+    get_prop "ro.vendor.build.fingerprint"  system/system/build_default.prop       ||
+    get_prop "ro.vendor.build.fingerprint"  vendor/euclid/my_manifest/build.prop   ||
+    get_prop "ro.vendor.build.fingerprint"  odm/etc/fingerprint/build.default.prop ||
+    get_prop "ro.vendor.build.fingerprint"  vendor/build*.prop                     ||
+    get_prop "ro.build.fingerprint"         my_manifest/build*.prop                ||
+    get_prop "ro.build.fingerprint"         system/system/build_default.prop       ||
+    get_prop "ro.build.fingerprint"         vendor/euclid/my_manifest/build.prop   ||
+    get_prop "ro.build.fingerprint"         {system,system/system}/build*.prop     ||
+    get_prop "ro.product.build.fingerprint" product/build*.prop                    ||
+    get_prop "ro.system.build.fingerprint"  {system,system/system}/build*.prop     ||
+    get_prop "ro.build.fingerprint"         my_product/build.prop                  ||
+    get_prop "ro.system.build.fingerprint"  my_product/build.prop                  ||
+    get_prop "ro.vendor.build.fingerprint"  my_product/build.prop
+)
+
+# 'codename' property (e.g. caiman)
+codename=$(
+    get_prop "ro.product.odm.device"        odm/etc/build*.prop                                 ||
+    get_prop "ro.product.odm.device"        system/system/build_default.prop                    ||
+    get_prop "ro.product.device"            odm/etc/fingerprint/build.default.prop              ||
+    get_prop "ro.product.device"            my_manifest/build*.prop                             ||
+    get_prop "ro.product.device"            system/system/build_default.prop                    ||
+    get_prop "ro.product.device"            vendor/euclid/my_manifest/build.prop                ||
+    get_prop "ro.product.vendor.device"     system/system/build_default.prop                    ||
+    get_prop "ro.product.vendor.device"     vendor/euclid/my_manifest/build.prop                ||
+    get_prop "ro.vendor.product.device"     system/system/build_default.prop                    ||
+    get_prop "ro.vendor.product.device"     vendor/build*.prop                                  ||
+    get_prop "ro.product.vendor.device"     vendor/build*.prop                                  ||
+    get_prop "ro.product.device"            {vendor,system,system/system}/build*.prop           ||
+    get_prop "ro.vendor.product.device.oem" odm/build.prop                                      ||
+    get_prop "ro.vendor.product.device.oem" vendor/euclid/odm/build.prop                        ||
+    get_prop "ro.product.vendor.device"     my_manifest/build*.prop                             ||
+    get_prop "ro.product.system.device"     {system,system/system}/build*.prop                  ||
+    get_prop "ro.product.system.device"     vendor/euclid/*/build.prop                          ||
+    get_prop "ro.product.product.device"    vendor/euclid/*/build.prop                          ||
+    get_prop "ro.product.product.device"    system/system/build_default.prop                    ||
+    get_prop "ro.product.product.model"     vendor/euclid/*/build.prop                          ||
+    get_prop "ro.product.device"            {oppo_product,my_product}/build*.prop               ||
+    get_prop "ro.product.product.device"    oppo_product/build*.prop                            ||
+    get_prop "ro.product.system.device"     my_product/build*.prop                              ||
+    get_prop "ro.product.vendor.device"     my_product/build*.prop                              ||
+    { get_prop "ro.build.fota.version"      {system,system/system}/build*.prop | cut -d- -f1; } ||
+    get_prop "ro.build.product"             {vendor,system,system/system}/build*.prop           ||
+    echo "$fingerprint" | cut -d/ -f3 | cut -d: -f1
+)
+
+# 'brand' property (e.g. google)
+brand=$(
+    get_prop "ro.product.odm.brand"     odm/etc/"${codename}"_build.prop             ||
+    get_prop "ro.product.odm.brand"     odm/etc/build*.prop                          ||
+    get_prop "ro.product.odm.brand"     system/system/build_default.prop             ||
+    get_prop "ro.product.brand"         odm/etc/fingerprint/build.default.prop       ||
+    get_prop "ro.product.brand"         my_product/build*.prop                       ||
+    get_prop "ro.product.brand"         system/system/build_default.prop             ||
+    get_prop "ro.product.brand"         vendor/euclid/my_manifest/build.prop         ||
+    get_prop "ro.product.brand"         {vendor,system,system/system}/build*.prop    ||
+    get_prop "ro.product.brand.sub"     my_product/build*.prop                       ||
+    get_prop "ro.product.brand.sub"     system/system/euclid/my_product/build*.prop  ||
+    get_prop "ro.product.vendor.brand"  my_manifest/build*.prop                      ||
+    get_prop "ro.product.vendor.brand"  system/system/build_default.prop             ||
+    get_prop "ro.product.vendor.brand"  vendor/euclid/my_manifest/build.prop         ||
+    get_prop "ro.product.vendor.brand"  vendor/build*.prop                           ||
+    get_prop "ro.vendor.product.brand"  vendor/build*.prop                           ||
+    get_prop "ro.product.system.brand"  {system,system/system}/build*.prop           ||
+    get_prop "ro.product.system.brand"  vendor/euclid/*/build.prop                   ||
+    get_prop "ro.product.product.brand" vendor/euclid/product/build*.prop            ||
+    get_prop "ro.product.odm.brand"     my_manifest/build*.prop                      ||
+    get_prop "ro.product.odm.brand"     vendor/euclid/my_manifest/build.prop         ||
+    get_prop "ro.product.odm.brand"     vendor/odm/etc/build*.prop                   ||
+    get_prop "ro.product.brand"         {oppo_product,my_product}/build*.prop        ||
+    echo "$fingerprint" | cut -d/ -f1                                                ||
+    echo "$manufacturer"
+)
+# Special case: override if brand is OPPO
+[[ "$brand" == "OPPO" ]] && brand=$(get_prop "ro.product.system.brand" vendor/euclid/*/build.prop || echo "$brand")
+
+# 'description' property (e.g. caiman-user 15 AP4A.241205.013 12621605 release-keys)
+description=$(
+    get_prop "ro.build.description"         {system,system/system}/build.prop      ||
+    get_prop "ro.build.description"         {system,system/system}/build*.prop     ||
+    get_prop "ro.vendor.build.description"  vendor/build.prop                      ||
+    get_prop "ro.vendor.build.description"  vendor/build*.prop                     ||
+    get_prop "ro.product.build.description" product/build.prop                     ||
+    get_prop "ro.product.build.description" product/build*.prop                    ||
+    get_prop "ro.system.build.description"  {system,system/system}/build*.prop     ||
+    echo "$flavor $release $id $incremental $tags"
+)
+
+# Remaining properties
+abilist=$(
+    get_prop "ro.product.cpu.abilist"        {system,system/system}/build*.prop ||
+    get_prop "ro.vendor.product.cpu.abilist" vendor/build*.prop
+)
+
+locale=$(get_prop "ro.product.locale" {system,system/system}/build*.prop || echo "undefined")
+density=$(get_prop "ro.sf.lcd_density" {vendor,system,system/system}/build*.prop || echo "undefined")
+is_ab=$(get_prop "ro.build.ab_update" {system,system/system,vendor}/build*.prop || echo "false")
+treble_support=$(get_prop "ro.treble.enabled" {system,system/system}/build*.prop || echo "false")
+
+otaver=$(
+    get_prop "ro.build.version.ota" {vendor/euclid/product,oppo_product,system,system/system}/build*.prop ||
+    get_prop "ro.build.fota.version" {system,system/system}/build*.prop
+)
+[[ -n "$otaver" && -z "$fingerprint" ]] && branch=$(echo "$otaver" | tr ' ' '-')
+branch=${branch:-$(echo "$description" | tr ' ' '-')}
 
 if [[ "$PUSH_TO_GITLAB" = true ]]; then
 	rm -rf .github_token
@@ -989,7 +1242,7 @@ fi
 platform=$(echo "${platform}" | tr '[:upper:]' '[:lower:]' | tr -dc '[:print:]' | tr '_' '-' | cut -c 1-35)
 top_codename=$(echo "${codename}" | tr '[:upper:]' '[:lower:]' | tr -dc '[:print:]' | tr '_' '-' | cut -c 1-35)
 manufacturer=$(echo "${manufacturer}" | tr '[:upper:]' '[:lower:]' | tr -dc '[:print:]' | tr '_' '-' | cut -c 1-35)
-[ -f "bootRE/ikconfig" ] && kernel_version=$(cat bootRE/ikconfig | grep "Kernel Configuration" | head -1 | awk '{print $3}')
+[ -f "ikconfig" ] && kernel_version=$(cat ikconfig | grep "Kernel Configuration" | head -1 | awk '{print $3}')
 # Repo README File
 printf "## %s\n- Manufacturer: %s\n- Platform: %s\n- Codename: %s\n- Brand: %s\n- Flavor: %s\n- Release Version: %s\n- Kernel Version: %s\n- Id: %s\n- Incremental: %s\n- Tags: %s\n- CPU Abilist: %s\n- A/B Device: %s\n- Treble Device: %s\n- Locale: %s\n- Screen Density: %s\n- Fingerprint: %s\n- OTA version: %s\n- Branch: %s\n- Repo: %s\n" "${description}" "${manufacturer}" "${platform}" "${codename}" "${brand}" "${flavor}" "${release}" "${kernel_version}" "${id}" "${incremental}" "${tags}" "${abilist}" "${is_ab}" "${treble_support}" "${locale}" "${density}" "${fingerprint}" "${otaver}" "${branch}" "${repo}" > "${OUTDIR}"/README.md
 cat "${OUTDIR}"/README.md
@@ -1008,7 +1261,7 @@ else
 fi
 if [[ -f ${twrpimg} ]]; then
 	mkdir -p $twrpdtout
-	uvx -p 3.9 --from git+https://github.com/twrpdtgen/twrpdtgen@master twrpdtgen $twrpimg -o $twrpdtout
+	uvx --from git+https://github.com/twrpdtgen/twrpdtgen@master twrpdtgen $twrpimg -o $twrpdtout
 	if [[ "$?" = 0 ]]; then
 		[[ ! -e "${OUTDIR}"/twrp-device-tree/README.md ]] && curl https://raw.githubusercontent.com/wiki/SebaUbuntu/TWRP-device-tree-generator/4.-Build-TWRP-from-source.md > ${twrpdtout}/README.md
 	fi
@@ -1026,7 +1279,7 @@ find "$OUTDIR" -type f -printf '%P\n' | sort | grep -v ".git/" > "$OUTDIR"/all_f
 if [[ "$treble_support" = true ]]; then
         aospdtout="aosp-device-tree"
         mkdir -p $aospdtout
-        uvx -p 3.9 aospdtgen $OUTDIR -o $aospdtout
+        uvx aospdtgen $OUTDIR -o $aospdtout
 
         # Remove all .git directories from aospdtout
         rm -rf $(find $aospdtout -type d -name ".git")
@@ -1042,43 +1295,42 @@ function write_sha1sum(){
 	local SRC_FILE=$1
 	local DST_FILE=$2
 
-	# Temporary file
-	local TMP_FILE=${SRC_FILE}.sha1sum.tmp
-	
-	# Get rid of all the Blank lines and Comments
-	( cat ${SRC_FILE} | grep -v '^[[:space:]]*$' | grep -v "# " ) > ${TMP_FILE}
+	# Temporary files
+	local TMP_PAIRS="${SRC_FILE}.pairs.tmp"
+	local TMP_SUMS="${SRC_FILE}.sums.tmp"
 
-	# Append the sha1sum of blobs in the Destination File
-	cp ${SRC_FILE} ${DST_FILE}
-	cat ${TMP_FILE} | while read -r i; do {
-		local BLOB=${i}
+	# Resolve each blob to its actual path
+	grep -v '^[[:space:]]*$' "${SRC_FILE}" | grep -v '^#' | while IFS= read -r blob; do
+		local topdir="${blob%%/*}"
+		local resolved="$blob"
+		[[ "${topdir:0:1}" == "-" ]] && resolved="${topdir#-}/${blob#${topdir}/}"
+		local path="$resolved"
+		[[ ! -e "$path" && -e "system/$path" ]] && path="system/$path"
+		[[ ! -e "$path" && -e "system/system/$path" ]] && path="system/system/$path"
+		printf '%s\t%s\n' "$blob" "$path"
+	done > "${TMP_PAIRS}"
 
-		# Do we have a "-" before the blob's path? If yes, then remove it
-		local BLOB_TOPDIR=$(echo ${BLOB} | cut -d / -f1)
-		[ "${BLOB_TOPDIR:0:1}" = "-" ] && local BLOB=${BLOB_TOPDIR/-/}/${BLOB/${BLOB_TOPDIR}\//}
+	# sha1sum on all files at once
+	cut -f2 "${TMP_PAIRS}" | xargs sha1sum 2>/dev/null > "${TMP_SUMS}"
 
-		# Is it a non- /vendor blob?
-		[ ! -e "${BLOB}" ] && {
-			# for system libs, bins etc.
-			if [ -e "system/${BLOB}" ]; then
-				local BLOB="system/${BLOB}"
-			# for system-as-root system libs, bins etc.
-			elif [ -e "system/system/${BLOB}" ]; then
-				local BLOB="system/system/${BLOB}"
-			fi
+	# Load pairs + sums and write to DST_FILE
+	awk '
+		FILENAME == ARGV[1] {
+			split($0, a, "\t")
+			path2blob[a[2]] = a[1]
+			next
 		}
-		local SHA1=$(sha1sum ${BLOB} | gawk '{print $1}')
+		FILENAME == ARGV[2] {
+			blob = path2blob[$2]
+			if (blob != "") blob2sha[blob] = $1
+			next
+		}
+		/^[[:space:]]*$/ || /^#/ { print; next }
+		{ print ($0 in blob2sha) ? $0 "|" blob2sha[$0] : $0 }
+	' "${TMP_PAIRS}" "${TMP_SUMS}" "${SRC_FILE}" > "${DST_FILE}"
 
-		local BLOB=${i} # Switch back to the Original Blob's name
-		local ORG_EXP="${BLOB}"
-		local FINAL_EXP="${BLOB}|${SHA1}"
-
-		# Append the |sha1sum
-		sed -i "s:${ORG_EXP}$:${FINAL_EXP}:g" "${DST_FILE}"
-	}; done
-
-	# Delete the Temporary file
-	rm ${TMP_FILE}
+	# Delete the Temporary files
+	rm -f "${TMP_PAIRS}" "${TMP_SUMS}"
 }
 
 # Generate proprietary-files.txt
@@ -1247,7 +1499,6 @@ elif [[ -s "${PROJECT_DIR}"/.gitlab_token ]]; then
 
 	# Remove The Journal File Inside System/Vendor
 	find . -mindepth 2 -type d -name "\[SYS\]" -exec rm -rf {} \; 2>/dev/null
-	split_files 62M 47M
 	printf "\nFinal Repository Should Look Like...\n" && ls -lAog
 	printf "\n\nStarting Git Init...\n"
 
@@ -1260,51 +1511,61 @@ elif [[ -s "${PROJECT_DIR}"/.gitlab_token ]]; then
 	[[ -z "$(git config --get user.name)" ]] && git config user.name "Sushrut1101"
 
 	# Create Subgroup
-	GRP_ID=$(curl -s --request GET --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "${GITLAB_HOST}/api/v4/groups/${GIT_ORG}" | jq -r '.id')
-	curl --request POST \
-	--header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-	--header "Content-Type: application/json" \
-	--data '{"name": "'"${brand}"'", "path": "'"$(echo ${brand} | tr [:upper:] [:lower:])"'", "visibility": "public", "parent_id": "'"${GRP_ID}"'"}' \
-	"${GITLAB_HOST}/api/v4/groups/"
+	GRP_ID=$(curl -s \
+        --request GET \
+        --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+        "${GITLAB_HOST}/api/v4/groups/${GIT_ORG}" | jq -r '.id')
+	curl -s \
+        --request POST \
+        --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data "{
+            \"name\": \"${brand}\",
+            \"path\": \"$(echo "${brand}" | tr '[:upper:]' '[:lower:]')\",
+            \"visibility\": \"public\",
+            \"parent_id\": \"${GRP_ID}\"
+        }" \
+        "${GITLAB_HOST}/api/v4/groups/"
 	echo ""
 
 	# Subgroup ID
-	get_gitlab_subgrp_id(){
-		local SUBGRP=$(echo "$1" | tr '[:upper:]' '[:lower:]')
-		curl -s --request GET --header "PRIVATE-TOKEN: $GITLAB_TOKEN" "${GITLAB_HOST}/api/v4/groups/${GIT_ORG}/subgroups" | jq -r .[] | jq -r .path,.id > /tmp/subgrp.txt
-		local i
-		for i in $(seq "$(cat /tmp/subgrp.txt | wc -l)")
-		do
-			local TMP_I=$(cat /tmp/subgrp.txt | head -"$i" | tail -1)
-			[[ "$TMP_I" == "$SUBGRP" ]] && cat /tmp/subgrp.txt | head -$(("$i"+1)) | tail -1 > "$2"
-		done
-		}
+	get_gitlab_subgrp_id() {
+    	local subgrp="${1,,}"
 
-	get_gitlab_subgrp_id ${brand} /tmp/subgrp_id.txt
-	SUBGRP_ID=$(< /tmp/subgrp_id.txt)
+    	curl -s \
+	        --request GET \
+    	    --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+			"${GITLAB_HOST}/api/v4/groups/${GIT_ORG}/subgroups?per_page=100" \
+    		| jq -r --arg name "$subgrp" '.[] | select(.path == $name) | .id'
+	}
+
+	SUBGRP_ID=$(get_gitlab_subgrp_id "${brand}")
 
 	# Create Repository
-	curl -s \
-	--header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
-	-X POST \
-	"${GITLAB_HOST}/api/v4/projects?name=${codename}&namespace_id=${SUBGRP_ID}&visibility=public"
+    curl -s \
+        --request POST \
+        --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data "{
+            \"name\": \"${codename}\",
+            \"namespace_id\": \"${SUBGRP_ID}\",
+            \"visibility\": \"public\"
+        }" \
+        "${GITLAB_HOST}/api/v4/projects"
 
 	# Get Project/Repo ID
-	get_gitlab_project_id(){
-		local PROJ="$1"
-		curl -s --request GET --header "PRIVATE-TOKEN: $GITLAB_TOKEN" "${GITLAB_HOST}/api/v4/groups/$2/projects" | jq -r .[] | jq -r .path,.id > /tmp/proj.txt
-		local i
-		for i in $(seq "$(cat /tmp/proj.txt | wc -l)")
-		do
-			local TMP_I=$(cat /tmp/proj.txt | head -"$i" | tail -1)
-			[[ "$TMP_I" == "$PROJ" ]] && cat /tmp/proj.txt | head -$(("$i"+1)) | tail -1 > "$3"
-		done
-		}
-	get_gitlab_project_id ${codename} ${SUBGRP_ID} /tmp/proj_id.txt
-	PROJECT_ID=$(< /tmp/proj_id.txt)
+	get_gitlab_project_id() {
+	    local proj="$1"
+	    local group_id="$2"
 
-	# Delete the Temporary Files
-	rm -rf /tmp/{subgrp,subgrp_id,proj,proj_id}.txt
+    	curl -s \
+	        --request GET \
+    	    --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+			"${GITLAB_HOST}/api/v4/groups/${group_id}/projects?per_page=100" \
+    		| jq -r --arg name "$proj" '.[] | select(.path == $name) | .id'
+	}
+
+	PROJECT_ID=$(get_gitlab_project_id "${codename}" "${SUBGRP_ID}")
 
 	# Commit and Push
 	# Pushing via HTTPS doesn't work on GitLab for Large Repos (it's an issue with gitlab for large repos)
@@ -1312,7 +1573,12 @@ elif [[ -s "${PROJECT_DIR}"/.gitlab_token ]]; then
 	git remote add origin git@${GITLAB_INSTANCE}:${GIT_ORG}/${repo}.git
 
 	# Ensure that the target repo is public
-	curl --request PUT --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" --url ''"${GITLAB_HOST}"'/api/v4/projects/'"${PROJECT_ID}"'' --data "visibility=public"
+    curl -s \
+        --request PUT \
+        --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data '{"visibility": "public"}' \
+        "${GITLAB_HOST}/api/v4/projects/${PROJECT_ID}"
 	printf "\n"
 
 	# Push to GitLab
@@ -1325,11 +1591,14 @@ elif [[ -s "${PROJECT_DIR}"/.gitlab_token ]]; then
 	done
 
 	# Update the Default Branch
-	curl	--request PUT \
-		--header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
-		--url ''"${GITLAB_HOST}"'/api/v4/projects/'"${PROJECT_ID}"'' \
-		--data "default_branch=${branch}"
-	printf "\n"
+	curl -s \
+	    --request PUT \
+	    --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+	    --header "Content-Type: application/json" \
+	    --data "{\"default_branch\": \"${branch}\"}" \
+	    "${GITLAB_HOST}/api/v4/projects/${PROJECT_ID}"
+
+	printf "\nDone! Repo available at %s/%s/%s\n" "${GITLAB_HOST}" "${GIT_ORG}" "${repo}"
 
 	# Telegram channel post
 	if [[ -s "${PROJECT_DIR}"/.tg_token ]]; then
