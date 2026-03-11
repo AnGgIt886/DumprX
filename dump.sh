@@ -9,4 +9,4 @@ echo $TG_CHAT >> .tg_chat
 export PUSH_TO_GITLAB="true"
 export TERM=xterm
 chmod +x dumper.sh
-./dumper.sh "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS3.0.7.0.WOCCNXM/dada_images_OS3.0.7.0.WOCCNXM_20260113.0000.00_16.0_cn_c2f80ad0f9.tgz"
+./dumper.sh "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS3.0.15.0.WPACNXM/nezha_images_OS3.0.15.0.WPACNXM_20260204.0000.00_16.0_cn_308cc1ae31.tgz"
