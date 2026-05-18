@@ -9,4 +9,4 @@ echo $TG_CHAT >> .tg_chat
 export PUSH_TO_GITLAB="true"
 export TERM=xterm
 chmod +x dumper.sh
-./dumper.sh "https://cdnorg.d.miui.com/V14.0.9.0.TGEMIXM/fog_global_images_V14.0.9.0.TGEMIXM_20250206.0000.00_13.0_global_56c1669749.tgz"
+./dumper.sh "https://sourceforge.net/projects/joes-android-builds/files/pixelos/PixelOS_chime-16.2-20260512-1735.zip/download"
