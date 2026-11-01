@@ -312,7 +312,7 @@ fi
 # Oppo .ofp Check
 if ${BIN_7ZZ} l -ba "${FILEPATH}" | gawk '{print $NF}' | grep -q ".*.ofp" 2>/dev/null; then
 	printf "Oppo ofp Detected.\n"
-	foundofp=$(${BIN_7ZZ} l -ba "${FILEPATH}" | gawk '{print $NF}' | grep ".*.ofp")
+	foundofp=$(${BIN_7ZZ} l -ba "${FILEPATH}" | gawk '{print $NF}' | grep ".*\.ofp")
 	${BIN_7ZZ} e -y -- "${FILEPATH}" "${foundofp}" */"${foundofp}" 2>/dev/null >> "${TMPDIR}"/zip.log
 	mkdir -p "${INPUTDIR}" 2>/dev/null && rm -rf -- "${INPUTDIR:?}"/* 2>/dev/null
 	mv "$(echo "${foundofp}" | gawk -F['/'] '{print $NF}')" "${INPUTDIR}"/
@@ -323,26 +323,28 @@ if ${BIN_7ZZ} l -ba "${FILEPATH}" | gawk '{print $NF}' | grep -q ".*.ofp" 2>/dev
 	exit
 fi
 if [[ "${EXTENSION}" == "ofp" ]]; then
-	printf "Oppo ofp Detected.\n"
-	# Either Move Downloaded/Re-Loaded File Or Copy Local File
-	mv -f "${INPUTDIR}"/"${FILE}" "${TMPDIR}"/"${FILE}" 2>/dev/null || cp -a "${FILEPATH}" "${TMPDIR}"/"${FILE}"
-	printf "Decrypting ofp & extracing...\n"
-	uv run --with-requirements "${UTILSDIR}/oppo_decrypt/requirements.txt" "$OFP_QC_DECRYPT" "${TMPDIR}"/"${FILE}" out
-	if [[ ! -f "${TMPDIR}"/out/boot.img || ! -f "${TMPDIR}"/out/userdata.img ]]; then
-		uv run --with-requirements "${UTILSDIR}/oppo_decrypt/requirements.txt" "$OFP_MTK_DECRYPT" "${TMPDIR}"/"${FILE}" out
-		if [[ ! -f "${TMPDIR}"/out/boot.img || ! -f "${TMPDIR}"/out/userdata.img ]]; then
-			printf "ofp decryption error.\n" && exit 1
-		fi
-	fi
-	mkdir -p "${INPUTDIR}" 2>/dev/null && rm -rf -- "${INPUTDIR:?}"/* 2>/dev/null
-	if [[ -d "${TMPDIR}"/out ]]; then
-		mv "${TMPDIR}"/out/* "${INPUTDIR}"/
-	fi
-	rm -rf "${TMPDIR:?}"/*
-	printf "Re-Loading The Decrypted Contents.\n"
-	cd "${PROJECT_DIR}"/ || exit
-	( bash "${0}" "${PROJECT_DIR}/input/" ) || exit 1
-	exit
+    printf "Oppo OFP Detected.\n"
+    mv -f "${INPUTDIR}/${FILE}" "${TMPDIR}/${FILE}" 2>/dev/null || cp -a "${FILEPATH}" "${TMPDIR}/${FILE}"
+    printf "Decrypting OFP...\n"
+    uv run -q --with-requirements "${UTILSDIR}/oppo_decrypt/requirements.txt" \
+        "${OFP_QC_DECRYPT}" "${TMPDIR}/${FILE}" "${TMPDIR}/out" >/dev/null
+
+    if [[ ! -f "${TMPDIR}/out/boot.img" ]]; then
+        printf "QC decrypt failed, trying MTK...\n"
+        uv run -q --with-requirements "${UTILSDIR}/oppo_decrypt/requirements.txt" \
+            "${OFP_MTK_DECRYPT}" "${TMPDIR}/${FILE}" "${TMPDIR}/out" >/dev/null
+    fi
+    if [[ ! -f "${TMPDIR}/out/boot.img" ]]; then
+        printf "OFP decryption failed.\n" "${TMPDIR}"
+        exit 1
+    fi
+    mkdir -p "${INPUTDIR}" && rm -rf -- "${INPUTDIR:?}"/*
+    mv "${TMPDIR}/out/"* "${INPUTDIR}/"
+    rm -rf "${TMPDIR:?}"/*
+    printf "Re-Loading The Decrypted Contents...\n"
+    cd "${PROJECT_DIR}" || exit 1
+    bash "${0}" "${PROJECT_DIR}/input/" || exit 1
+    exit
 fi
 # Xiaomi .tgz Check
 if [[ "${FILE##*.}" == "tgz" || "${FILE#*.}" == "tar.gz" ]]; then
@@ -1053,6 +1055,8 @@ codename=$(
     get_prop "ro.product.device"            my_manifest/build*.prop                             ||
     get_prop "ro.product.device"            system/system/build_default.prop                    ||
     get_prop "ro.product.device"            vendor/euclid/my_manifest/build.prop                ||
+    get_prop "ro.product.device"            {oppo_product,my_product}/build*.prop               ||
+    get_prop "ro.product.product.device"    {oppo_product,my_product}/build*.prop               ||
     get_prop "ro.product.vendor.device"     system/system/build_default.prop                    ||
     get_prop "ro.product.vendor.device"     vendor/euclid/my_manifest/build.prop                ||
     get_prop "ro.vendor.product.device"     system/system/build_default.prop                    ||
@@ -1067,8 +1071,6 @@ codename=$(
     get_prop "ro.product.product.device"    vendor/euclid/*/build.prop                          ||
     get_prop "ro.product.product.device"    system/system/build_default.prop                    ||
     get_prop "ro.product.product.model"     vendor/euclid/*/build.prop                          ||
-    get_prop "ro.product.device"            {oppo_product,my_product}/build*.prop               ||
-    get_prop "ro.product.product.device"    oppo_product/build*.prop                            ||
     get_prop "ro.product.system.device"     my_product/build*.prop                              ||
     get_prop "ro.product.vendor.device"     my_product/build*.prop                              ||
     { get_prop "ro.build.fota.version"      {system,system/system}/build*.prop | cut -d- -f1; } ||
@@ -1268,6 +1270,13 @@ rm -rf "${TMPDIR}" 2>/dev/null
 
 commit_and_push(){
 	local DIRS=(
+		"boot"
+		"recovery"
+		"vendor_boot"
+		"init_boot"
+		"dtbo"
+		"aosp-device-tree"
+		"twrp-device-tree"
 		"system_ext"
 		"product"
 		"system_dlkm"
@@ -1278,30 +1287,41 @@ commit_and_push(){
 		"system"
 	)
 
+	git config http.postBuffer 524288000
+
 	git lfs install
+	git config lfs.locksverify false
 	[ -e ".gitattributes" ] || find . -type f -not -path ".git/*" -size +100M -exec git lfs track {} \;
 	[ -e ".gitattributes" ] && {
+		echo "[INFO] Setting up Git LFS..."
 		git add ".gitattributes"
-		git commit -sm "Setup Git LFS"
+		git commit -sm "${codename}: Setup Git LFS" >/dev/null
 		git push -u origin "${branch}"
 	}
 
 	git add $(find -type f -name '*.apk')
-	git commit -sm "Add apps for ${description}"
+	git commit -sm "${codename}: Add apps" -m "for ${description}" >/dev/null
+	echo "[INFO] Pushing apps..."
 	git push -u origin "${branch}"
+
+	[ -f "ikconfig" ] && git add "ikconfig"
 
 	for i in "${DIRS[@]}"; do
 		[ -d "${i}" ] && git add "${i}"
 		[ -d system/"${i}" ] && git add system/"${i}"
 		[ -d system/system/"${i}" ] && git add system/system/"${i}"
 		[ -d vendor/"${i}" ] && git add vendor/"${i}"
+		[ -f "${i}.img" ] && git add "${i}".img
+		[ -f "${i}.elf" ] && git add "${i}".elf
 
-		git commit -sm "Add ${i} for ${description}"
+		git commit -sm "${codename}: Add ${i}" -m "for ${description}" >/dev/null
+		echo "[INFO] Pushing ${i}..."
 		git push -u origin "${branch}"
 	done
 
 	git add .
-	git commit -sm "Add extras for ${description}"
+	git commit -sm "${codename}: Add extras" -m "for ${description}" >/dev/null
+	echo "[INFO] Pushing extras..."
 	git push -u origin "${branch}"
 }
 
@@ -1341,7 +1361,6 @@ if [[ -s "${PROJECT_DIR}"/.github_token ]]; then
 	printf "\nFinal Repository Should Look Like...\n" && ls -lAog
 	printf "\n\nStarting Git Init...\n"
 	git init		# Insure Your Github Authorization Before Running This Script
-	git config --global http.postBuffer 524288000		# A Simple Tuning to Get Rid of curl (18) error while `git push`
 	git checkout -b "${branch}" || { git checkout -b "${incremental}" && export branch="${incremental}"; }
 	find . \( -name "*sensetime*" -o -name "*.lic" \) | cut -d'/' -f'2-' >| .gitignore
 	[[ ! -s .gitignore ]] && rm .gitignore
@@ -1353,7 +1372,19 @@ if [[ -s "${PROJECT_DIR}"/.github_token ]]; then
 	curl -s -X PUT -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.mercy-preview+json" -d '{ "names": ["'"${platform}"'","'"${manufacturer}"'","'"${top_codename}"'","firmware","dump"]}' "https://api.github.com/repos/${GIT_ORG}/${repo}/topics" 	# Update Repository Topics
 	
 	# Commit and Push
-	printf "\nPushing to %s via HTTPS...\nBranch:%s\n" "https://github.com/${GIT_ORG}/${repo}.git" "${branch}"
+	case "${DUMPRX_USE_SSH}" in
+		true|1)
+			git_prefix="git@github.com:"
+			method="SSH"
+			;;
+		*)
+			git_prefix="https://${GITHUB_TOKEN}@github.com/"
+			method="HTTPS"
+			;;
+	esac
+
+	git remote add origin "${git_prefix}${GIT_ORG}/${repo}.git"
+	printf "\nPushing to %s via ${method}...\nBranch:%s\n" "https://github.com/${GIT_ORG}/${repo}.git" "${branch}"
 	sleep 1
 	git remote add origin https://${GITHUB_TOKEN}@github.com/${GIT_ORG}/${repo}.git
 	commit_and_push
@@ -1408,7 +1439,6 @@ elif [[ -s "${PROJECT_DIR}"/.gitlab_token ]]; then
 	printf "\n\nStarting Git Init...\n"
 
 	git init		# Insure Your GitLab Authorization Before Running This Script
-	git config --global http.postBuffer 524288000		# A Simple Tuning to Get Rid of curl (18) error while `git push`
 	git checkout -b "${branch}" || { git checkout -b "${incremental}" && export branch="${incremental}"; }
 	find . \( -name "*sensetime*" -o -name "*.lic" \) | cut -d'/' -f'2-' >| .gitignore
 	[[ ! -s .gitignore ]] && rm .gitignore
@@ -1473,9 +1503,18 @@ elif [[ -s "${PROJECT_DIR}"/.gitlab_token ]]; then
 	PROJECT_ID=$(get_gitlab_project_id "${codename}" "${SUBGRP_ID}")
 
 	# Commit and Push
-	# Pushing via HTTPS doesn't work on GitLab for Large Repos (it's an issue with gitlab for large repos)
-	# NOTE: Your SSH Keys Needs to be Added to your Gitlab Instance
-	git remote add origin git@${GITLAB_INSTANCE}:${GIT_ORG}/${repo}.git
+	case "${DUMPRX_USE_SSH}" in
+		true|1)
+			git_prefix="git@${GITLAB_INSTANCE}:"
+			method="SSH"
+			;;
+		*)
+			git_prefix="https://DumprX:${GITLAB_TOKEN}@${GITLAB_INSTANCE}/"
+			method="HTTPS"
+			;;
+	esac
+
+	git remote add origin "${git_prefix}${GIT_ORG}/${repo}.git"
 
 	# Ensure that the target repo is public
     curl -s \
@@ -1489,7 +1528,7 @@ elif [[ -s "${PROJECT_DIR}"/.gitlab_token ]]; then
 	# Push to GitLab
 	while [[ ! $(curl -sL "${GITLAB_HOST}/${GIT_ORG}/${repo}/-/raw/${branch}/all_files.txt" | grep "all_files.txt") ]]
 	do
-		printf "\nPushing to %s via SSH...\nBranch:%s\n" "${GITLAB_HOST}/${GIT_ORG}/${repo}.git" "${branch}"
+		printf "\nPushing to %s via ${method}...\nBranch:%s\n" "${GITLAB_HOST}/${GIT_ORG}/${repo}.git" "${branch}"
 		sleep 1
 		commit_and_push
 		sleep 1
